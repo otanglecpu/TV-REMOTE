@@ -7,11 +7,11 @@ android {
     namespace = "com.tvremote"
     compileSdk = 34
     defaultConfig {
-        applicationId = "com.tvremote.v3"
+        applicationId = "com.tvremote.wifi"
         minSdk = 28
         targetSdk = 34
-        versionCode = 3
-        versionName = "3.0"
+        versionCode = 4
+        versionName = "4.0"
     }
     signingConfigs {
         getByName("debug") {

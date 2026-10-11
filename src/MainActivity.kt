@@ -1,24 +1,24 @@
 package com.tvremote
 
-import android.Manifest
 import android.annotation.SuppressLint
 import android.app.Activity
 import android.app.AlertDialog
-import android.bluetooth.*
 import android.content.ClipData
 import android.content.ClipboardManager
-import android.content.Context
 import android.content.Intent
-import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.StateListDrawable
+import android.net.nsd.NsdManager
+import android.net.nsd.NsdServiceInfo
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
-import android.provider.Settings
+import android.security.keystore.KeyGenParameterSpec
+import android.security.keystore.KeyProperties
+import android.text.InputType
 import android.util.Log
 import android.view.Gravity
 import android.view.HapticFeedbackConstants
@@ -26,13 +26,36 @@ import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
 import android.widget.*
+import java.io.ByteArrayOutputStream
 import java.io.File
+import java.io.IOException
+import java.io.InputStream
+import java.io.OutputStream
+import java.math.BigInteger
+import java.net.Inet4Address
+import java.net.InetSocketAddress
+import java.net.Socket
+import java.security.KeyPairGenerator
+import java.security.KeyStore
+import java.security.MessageDigest
+import java.security.Principal
+import java.security.PrivateKey
+import java.security.cert.X509Certificate
+import java.security.interfaces.RSAPublicKey
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.Executors
+import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.TimeUnit
+import javax.net.ssl.SSLContext
+import javax.net.ssl.SSLSocket
+import javax.net.ssl.X509KeyManager
+import javax.net.ssl.X509TrustManager
+import javax.security.auth.x500.X500Principal
 
-@SuppressLint("MissingPermission")
 class MainActivity : Activity() {
     private val BG1 = Color.parseColor("#0B1020")
     private val BG2 = Color.parseColor("#1C1147")
@@ -47,10 +70,8 @@ class MainActivity : Activity() {
     private val AMBER = Color.parseColor("#FFB020")
     private val SLATE = Color.parseColor("#3A4166")
 
-    private var adapter: BluetoothAdapter? = null
-    private var hid: BluetoothHidDevice? = null
-    private var host: BluetoothDevice? = null
-    private var pending: BluetoothDevice? = null
+    data class Tv(val name: String, val host: String)
+
     private lateinit var status: TextView
     private lateinit var dot: View
     private lateinit var input: EditText
@@ -61,78 +82,489 @@ class MainActivity : Activity() {
     private lateinit var tabRemote: TextView
     private lateinit var tabLog: TextView
     private val main = Handler(Looper.getMainLooper())
-    private val cbExec = Executors.newSingleThreadExecutor()
-    private val typer = Executors.newSingleThreadExecutor()
+    private val net = Executors.newSingleThreadExecutor()
     private val prefs by lazy { getSharedPreferences("tv", MODE_PRIVATE) }
     private val logLines = ArrayList<String>()
     private val fmt = SimpleDateFormat("HH:mm:ss.SSS", Locale.US)
     private val logFile by lazy { File(filesDir, "log.txt") }
 
-    // HID descriptor: report 1 = keyboard, report 2 = consumer control (volume, home, back)
-    private val desc = intArrayOf(
-        0x05, 0x01, 0x09, 0x06, 0xA1, 0x01, 0x85, 0x01,
-        0x05, 0x07, 0x19, 0xE0, 0x29, 0xE7, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x08, 0x81, 0x02,
-        0x95, 0x01, 0x75, 0x08, 0x81, 0x01,
-        0x95, 0x06, 0x75, 0x08, 0x15, 0x00, 0x25, 0x65, 0x05, 0x07, 0x19, 0x00, 0x29, 0x65, 0x81, 0x00,
-        0xC0,
-        0x05, 0x0C, 0x09, 0x01, 0xA1, 0x01, 0x85, 0x02,
-        0x15, 0x00, 0x26, 0xFF, 0x03, 0x19, 0x00, 0x2A, 0xFF, 0x03, 0x75, 0x10, 0x95, 0x01, 0x81, 0x00,
-        0xC0
-    ).map { it.toByte() }.toByteArray()
+    private val ALIAS = "tvremote_client"
+    private var privateKey: PrivateKey? = null
+    private var clientCert: X509Certificate? = null
+    private val writeLock = Any()
+    @Volatile private var sock: SSLSocket? = null
+    @Volatile private var ready = false
+    @Volatile private var connecting = false
+    @Volatile private var closing = false
+    private val codeQ = LinkedBlockingQueue<String>()
+    private val found = ConcurrentHashMap<String, Tv>()
+    private val resolveQ = ConcurrentLinkedQueue<NsdServiceInfo>()
+    private var resolving = false
+    private val nsd by lazy { getSystemService(NSD_SERVICE) as NsdManager }
 
-    private val cb = object : BluetoothHidDevice.Callback() {
-        override fun onAppStatusChanged(pluggedDevice: BluetoothDevice?, registered: Boolean) {
-            log("onAppStatusChanged registered=$registered plugged=${pluggedDevice?.name}")
-            if (!registered) { setStatus("Bluetooth remote is not ready", RED); return }
-            setStatus("Ready. Tap Pair TV, or Choose TV if already paired.", Color.GRAY)
-            val last = prefs.getString("last", null)
-            val d = adapter?.bondedDevices?.firstOrNull { it.address == last }
-            if (d != null) { log("Auto-connecting to last TV"); runOnUiThread { connectTo(d) } }
-        }
-
-        override fun onConnectionStateChanged(device: BluetoothDevice?, state: Int) {
-            log("onConnectionStateChanged ${device?.name ?: device?.address} -> ${st(state)}")
-            when (state) {
-                BluetoothProfile.STATE_CONNECTED -> {
-                    host = device; pending = null
-                    setStatus("Connected to " + (device?.name ?: device?.address), GREEN)
-                }
-                BluetoothProfile.STATE_CONNECTING -> setStatus("Connecting...", AMBER)
-                BluetoothProfile.STATE_DISCONNECTED -> {
-                    if (host == device) {
-                        host = null
-                        setStatus("Disconnected. Tap Choose TV.", AMBER)
-                    } else if (pending == device) {
-                        pending = null
-                        setStatus("Could not connect. Open the Log tab.", RED)
-                    }
-                }
+    // ---------- tiny protobuf helpers ----------
+    object Pb {
+        fun varint(v0: Long): ByteArray {
+            val o = ByteArrayOutputStream()
+            var v = v0
+            while ((v and 0x7FL.inv()) != 0L) {
+                o.write(((v and 0x7FL) or 0x80L).toInt())
+                v = v ushr 7
             }
+            o.write(v.toInt())
+            return o.toByteArray()
         }
-
-        override fun onGetReport(device: BluetoothDevice?, type: Byte, id: Byte, bufferSize: Int) {
-            log("TV asked onGetReport type=$type id=$id size=$bufferSize (replied unsupported)")
-            if (device != null) hid?.reportError(device, BluetoothHidDevice.ERROR_RSP_UNSUPPORTED_REQ)
-        }
-
-        override fun onSetReport(device: BluetoothDevice?, type: Byte, id: Byte, data: ByteArray?) {
-            log("TV sent onSetReport type=$type id=$id len=${data?.size}")
-            if (device != null) hid?.reportError(device, BluetoothHidDevice.ERROR_RSP_SUCCESS)
-        }
-
-        override fun onSetProtocol(device: BluetoothDevice?, protocol: Byte) {
-            log("TV set protocol=$protocol")
-        }
-
-        override fun onInterruptData(device: BluetoothDevice?, reportId: Byte, data: ByteArray?) {
-            log("TV sent interrupt data id=$reportId len=${data?.size}")
-        }
-
-        override fun onVirtualCableUnplug(device: BluetoothDevice?) {
-            log("TV sent virtual cable unplug (it removed this phone)")
+        private fun tag(n: Int, wt: Int) = varint(((n shl 3) or wt).toLong())
+        fun f(n: Int, v: Long): ByteArray = tag(n, 0) + varint(v)
+        fun f(n: Int, b: ByteArray): ByteArray = tag(n, 2) + varint(b.size.toLong()) + b
+        fun f(n: Int, s: String): ByteArray = f(n, s.toByteArray(Charsets.UTF_8))
+        fun parse(b: ByteArray): Map<Int, List<Any>> {
+            val m = LinkedHashMap<Int, MutableList<Any>>()
+            var p = 0
+            fun rv(): Long {
+                var r = 0L
+                var s = 0
+                while (true) {
+                    val x = b[p++].toInt() and 0xFF
+                    r = r or ((x and 0x7F).toLong() shl s)
+                    if ((x and 0x80) == 0) break
+                    s += 7
+                }
+                return r
+            }
+            while (p < b.size) {
+                val k = rv()
+                val n = (k shr 3).toInt()
+                val wt = (k and 7L).toInt()
+                val v: Any = when (wt) {
+                    0 -> rv()
+                    2 -> { val l = rv().toInt(); val a = b.copyOfRange(p, p + l); p += l; a }
+                    1 -> { p += 8; 0L }
+                    5 -> { p += 4; 0L }
+                    else -> throw IOException("bad wire type $wt")
+                }
+                m.getOrPut(n) { ArrayList() }.add(v)
+            }
+            return m
         }
     }
 
+    private fun writeFrame(o: OutputStream, m: ByteArray) {
+        synchronized(writeLock) {
+            o.write(Pb.varint(m.size.toLong()))
+            o.write(m)
+            o.flush()
+        }
+    }
+
+    private fun readFrame(i: InputStream): ByteArray {
+        var len = 0
+        var s = 0
+        while (true) {
+            val x = i.read()
+            if (x < 0) throw IOException("connection closed by TV")
+            len = len or ((x and 0x7F) shl s)
+            if ((x and 0x80) == 0) break
+            s += 7
+        }
+        if (len < 0 || len > 1_000_000) throw IOException("bad frame size $len")
+        val b = ByteArray(len)
+        var off = 0
+        while (off < len) {
+            val r = i.read(b, off, len - off)
+            if (r < 0) throw IOException("connection closed by TV")
+            off += r
+        }
+        return b
+    }
+
+    // ---------- TLS with our own client certificate ----------
+    private class FixedKm(val key: PrivateKey, val chain: Array<X509Certificate>) : X509KeyManager {
+        override fun getClientAliases(keyType: String?, issuers: Array<out Principal>?): Array<String> = arrayOf("me")
+        override fun chooseClientAlias(keyType: Array<out String>?, issuers: Array<out Principal>?, socket: Socket?): String = "me"
+        override fun getServerAliases(keyType: String?, issuers: Array<out Principal>?): Array<String>? = null
+        override fun chooseServerAlias(keyType: String?, issuers: Array<out Principal>?, socket: Socket?): String? = null
+        override fun getCertificateChain(alias: String?): Array<X509Certificate> = chain
+        override fun getPrivateKey(alias: String?): PrivateKey = key
+    }
+
+    private val trustAll = object : X509TrustManager {
+        override fun checkClientTrusted(c: Array<X509Certificate>?, a: String?) {}
+        override fun checkServerTrusted(c: Array<X509Certificate>?, a: String?) {}
+        override fun getAcceptedIssuers(): Array<X509Certificate> = arrayOf()
+    }
+
+    private fun initKeys() {
+        try {
+            val ks = KeyStore.getInstance("AndroidKeyStore")
+            ks.load(null)
+            if (!ks.containsAlias(ALIAS)) {
+                val kpg = KeyPairGenerator.getInstance(KeyProperties.KEY_ALGORITHM_RSA, "AndroidKeyStore")
+                kpg.initialize(
+                    KeyGenParameterSpec.Builder(ALIAS, KeyProperties.PURPOSE_SIGN)
+                        .setKeySize(2048)
+                        .setDigests(
+                            KeyProperties.DIGEST_SHA256, KeyProperties.DIGEST_SHA384,
+                            KeyProperties.DIGEST_SHA512, KeyProperties.DIGEST_SHA1, KeyProperties.DIGEST_NONE
+                        )
+                        .setSignaturePaddings(KeyProperties.SIGNATURE_PADDING_RSA_PKCS1, KeyProperties.SIGNATURE_PADDING_RSA_PSS)
+                        .setCertificateSubject(X500Principal("CN=phone-remote"))
+                        .setCertificateSerialNumber(BigInteger.ONE)
+                        .build()
+                )
+                kpg.generateKeyPair()
+                log("Generated a new client key (you will need to pair again)")
+            }
+            privateKey = ks.getKey(ALIAS, null) as PrivateKey
+            clientCert = ks.getCertificate(ALIAS) as X509Certificate
+            log("Client key ready")
+        } catch (e: Exception) {
+            log("KEY ERROR: $e")
+            setStatus("Could not create the security key on this phone", RED)
+        }
+    }
+
+    private fun tls(host: String, port: Int): SSLSocket {
+        val k = privateKey ?: throw IOException("no client key")
+        val c = clientCert ?: throw IOException("no client certificate")
+        val ctx = SSLContext.getInstance("TLSv1.2")
+        ctx.init(arrayOf(FixedKm(k, arrayOf(c))), arrayOf(trustAll), null)
+        val s = ctx.socketFactory.createSocket() as SSLSocket
+        s.connect(InetSocketAddress(host, port), 8000)
+        s.soTimeout = 20000
+        s.startHandshake()
+        s.keepAlive = true
+        log("TLS connected to $host:$port (${s.session.protocol}, ${s.session.cipherSuite})")
+        return s
+    }
+
+    // ---------- Pairing (port 6467) ----------
+    private fun unsigned(n: BigInteger): ByteArray {
+        val b = n.toByteArray()
+        return if (b.size > 1 && b[0] == 0.toByte()) b.copyOfRange(1, b.size) else b
+    }
+
+    private fun pmsg(field: Int, body: ByteArray) = Pb.f(1, 2L) + Pb.f(2, 200L) + Pb.f(field, body)
+
+    private fun askCode() {
+        runOnUiThread {
+            val e = EditText(this).apply {
+                hint = "6 characters"
+                inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_CHARACTERS
+            }
+            AlertDialog.Builder(this).setTitle("Enter the code shown on the TV").setView(e).setCancelable(false)
+                .setPositiveButton("OK") { _, _ -> codeQ.offer(e.text.toString()) }
+                .setNegativeButton("Cancel") { _, _ -> codeQ.offer("") }
+                .show()
+        }
+    }
+
+    private fun pair(tv: Tv) {
+        Thread {
+            var s: SSLSocket? = null
+            try {
+                setStatus("Pairing with ${tv.name}...", AMBER)
+                log("Pairing: connecting to ${tv.host}:6467")
+                s = tls(tv.host, 6467)
+                val inp = s.inputStream
+                val out = s.outputStream
+                val serverCert = s.session.peerCertificates[0] as X509Certificate
+
+                fun recv(step: String): Map<Int, List<Any>> {
+                    val m = Pb.parse(readFrame(inp))
+                    val st = m[2]?.firstOrNull() as? Long
+                    log("Pairing [$step] TV replied, fields=${m.keys}, status=$st")
+                    if (st != null && st != 200L) throw IOException("TV rejected pairing step '$step' (status $st)")
+                    return m
+                }
+
+                val enc = Pb.f(1, 3L) + Pb.f(2, 6L)
+                writeFrame(out, pmsg(10, Pb.f(1, "androidtvremote") + Pb.f(2, "Phone Remote")))
+                recv("request")
+                writeFrame(out, pmsg(20, Pb.f(1, enc) + Pb.f(3, 1L)))
+                recv("options")
+                writeFrame(out, pmsg(30, Pb.f(1, enc) + Pb.f(2, 1L)))
+                recv("configuration")
+
+                codeQ.clear()
+                setStatus("Type the code shown on your TV screen", AMBER)
+                askCode()
+                val code = codeQ.poll(180, TimeUnit.SECONDS)?.trim()?.uppercase() ?: ""
+                if (code.length != 6 || !code.all { it in '0'..'9' || it in 'A'..'F' }) {
+                    throw IOException("No valid 6-character code entered")
+                }
+                val cb = ByteArray(3) { code.substring(it * 2, it * 2 + 2).toInt(16).toByte() }
+                val cc = clientCert!!.publicKey as RSAPublicKey
+                val sc = serverCert.publicKey as? RSAPublicKey ?: throw IOException("TV certificate is not RSA")
+                val md = MessageDigest.getInstance("SHA-256")
+                md.update(unsigned(cc.modulus))
+                md.update(unsigned(cc.publicExponent))
+                md.update(unsigned(sc.modulus))
+                md.update(unsigned(sc.publicExponent))
+                md.update(cb, 1, cb.size - 1)
+                val secret = md.digest()
+                log("Code check byte matches: ${secret[0] == cb[0]}")
+                writeFrame(out, pmsg(40, Pb.f(1, secret)))
+                val r = recv("secret")
+                log("Pairing finished, secret ack present=${r.containsKey(41)}")
+                setStatus("Paired. Connecting...", GREEN)
+                try { s.close() } catch (e: Exception) {}
+                Thread.sleep(800)
+                connectRemote(tv)
+            } catch (e: Exception) {
+                log("Pairing failed: $e")
+                setStatus("Pairing failed: ${e.message}. Open the Log tab.", RED)
+                try { s?.close() } catch (x: Exception) {}
+            }
+        }.start()
+    }
+
+    // ---------- Remote connection (port 6466) ----------
+    private fun saved(): List<Tv> =
+        (prefs.getString("saved", "") ?: "").split("\n").filter { it.contains("\t") }
+            .map { val p = it.split("\t"); Tv(p[1], p[0]) }
+
+    private fun saveTv(tv: Tv) {
+        val l = saved().filter { it.host != tv.host } + tv
+        prefs.edit().putString("saved", l.joinToString("\n") { it.host + "\t" + it.name })
+            .putString("last", tv.host).apply()
+    }
+
+    private fun closeSock() {
+        closing = true
+        ready = false
+        try { sock?.close() } catch (e: Exception) {}
+        sock = null
+    }
+
+    private fun connectRemote(tv: Tv) {
+        if (connecting) { log("Already connecting"); return }
+        connecting = true
+        closeSock()
+        closing = false
+        setStatus("Connecting to ${tv.name}...", AMBER)
+        Thread {
+            var wasReady = false
+            try {
+                val s = tls(tv.host, 6466)
+                s.soTimeout = 0
+                sock = s
+                val inp = s.inputStream
+                val devInfo = Pb.f(1, "Phone Remote") + Pb.f(2, "Android") + Pb.f(3, 1L) +
+                    Pb.f(4, "1") + Pb.f(5, "com.tvremote.wifi") + Pb.f(6, "1.0.0")
+                while (true) {
+                    val m = Pb.parse(readFrame(inp))
+                    when {
+                        m.containsKey(1) -> {
+                            log("TV sent configure; replying")
+                            writeFrame(s.outputStream, Pb.f(1, Pb.f(1, 622L) + Pb.f(2, devInfo)))
+                        }
+                        m.containsKey(2) -> {
+                            log("TV sent set_active; replying")
+                            writeFrame(s.outputStream, Pb.f(2, Pb.f(1, 622L)))
+                            if (!ready) { wasReady = true; onReady(tv) }
+                        }
+                        m.containsKey(8) -> {
+                            val p = Pb.parse(m[8]!![0] as ByteArray)
+                            val v = p[1]?.firstOrNull() as? Long ?: 0L
+                            writeFrame(s.outputStream, Pb.f(9, Pb.f(1, v)))
+                        }
+                        m.containsKey(40) -> { log("TV sent start"); if (!ready) { wasReady = true; onReady(tv) } }
+                        m.containsKey(3) -> log("TV sent an error message")
+                        else -> log("TV message fields=${m.keys}")
+                    }
+                }
+            } catch (e: Exception) {
+                if (!closing) log("Connection ended: $e")
+            }
+            ready = false
+            if (!closing) {
+                if (wasReady) setStatus("Disconnected. Tap Connect.", AMBER)
+                else setStatus("Could not connect. If this TV was never paired, tap Pair TV. Otherwise check the TV is on and on the same Wi-Fi.", RED)
+            }
+            connecting = false
+        }.start()
+    }
+
+    private fun onReady(tv: Tv) {
+        ready = true
+        saveTv(tv)
+        setStatus("Connected to ${tv.name}", GREEN)
+    }
+
+    private fun keyMsg(code: Int, dir: Int) = Pb.f(10, Pb.f(1, code.toLong()) + Pb.f(2, dir.toLong()))
+
+    private fun sendRemote(m: ByteArray) {
+        val o = sock?.outputStream ?: throw IOException("not connected")
+        writeFrame(o, m)
+    }
+
+    private fun lost(e: Exception) {
+        log("Send failed: $e")
+        ready = false
+        setStatus("Connection lost. Tap Connect.", RED)
+    }
+
+    private fun key(code: Int) {
+        if (!ready) { toast("Not connected. Tap Connect."); return }
+        net.execute { try { sendRemote(keyMsg(code, 3)) } catch (e: Exception) { lost(e) } }
+    }
+
+    private fun keyFor(c: Char): Pair<Int, Boolean>? = when (c) {
+        in 'a'..'z' -> (29 + (c - 'a')) to false
+        in 'A'..'Z' -> (29 + (c - 'A')) to true
+        in '0'..'9' -> (7 + (c - '0')) to false
+        ' ' -> 62 to false
+        '\n' -> 66 to false
+        '.' -> 56 to false
+        ',' -> 55 to false
+        '-' -> 69 to false
+        '/' -> 76 to false
+        ';' -> 74 to false
+        '\'' -> 75 to false
+        '@' -> 77 to false
+        '=' -> 70 to false
+        '_' -> 69 to true
+        '?' -> 76 to true
+        ':' -> 74 to true
+        '!' -> 8 to true
+        '(' -> 16 to true
+        ')' -> 7 to true
+        else -> null
+    }
+
+    private fun sendText() {
+        val t = input.text.toString()
+        if (t.isEmpty()) return
+        if (!ready) { toast("Not connected. Tap Connect."); return }
+        var skipped = 0
+        val seq = ArrayList<Pair<Int, Boolean>>()
+        for (c in t) { val m = keyFor(c); if (m == null) skipped++ else seq.add(m) }
+        net.execute {
+            try {
+                for ((code, shift) in seq) {
+                    if (shift) sendRemote(keyMsg(59, 1))
+                    sendRemote(keyMsg(code, 3))
+                    if (shift) sendRemote(keyMsg(59, 2))
+                    Thread.sleep(25)
+                }
+            } catch (e: Exception) { lost(e) }
+        }
+        log("Typed ${seq.size} characters ($skipped skipped)")
+        if (skipped > 0) toast("$skipped unsupported characters skipped (English letters, digits and common symbols only)")
+        input.setText("")
+    }
+
+    // ---------- Finding TVs ----------
+    private val disc = object : NsdManager.DiscoveryListener {
+        override fun onDiscoveryStarted(t: String) { log("Searching for TVs on Wi-Fi...") }
+        override fun onServiceFound(i: NsdServiceInfo) { log("Found service: ${i.serviceName}"); resolveQ.add(i); nextResolve() }
+        override fun onServiceLost(i: NsdServiceInfo) { log("Service lost: ${i.serviceName}") }
+        override fun onDiscoveryStopped(t: String) {}
+        override fun onStartDiscoveryFailed(t: String, e: Int) { log("Discovery failed to start: $e") }
+        override fun onStopDiscoveryFailed(t: String, e: Int) {}
+    }
+
+    private fun startDiscovery() {
+        try { nsd.discoverServices("_androidtvremote2._tcp", NsdManager.PROTOCOL_DNS_SD, disc) }
+        catch (e: Exception) { log("Discovery error: $e") }
+    }
+
+    @Suppress("DEPRECATION")
+    @Synchronized
+    private fun nextResolve() {
+        if (resolving) return
+        val i = resolveQ.poll() ?: return
+        resolving = true
+        try {
+            nsd.resolveService(i, object : NsdManager.ResolveListener {
+                override fun onResolveFailed(si: NsdServiceInfo, err: Int) {
+                    log("Could not resolve ${si.serviceName}: $err")
+                    resolving = false
+                    nextResolve()
+                }
+                override fun onServiceResolved(si: NsdServiceInfo) {
+                    val addr = if (Build.VERSION.SDK_INT >= 34)
+                        (si.hostAddresses.firstOrNull { it is Inet4Address } ?: si.hostAddresses.firstOrNull())?.hostAddress
+                    else si.host?.hostAddress
+                    if (addr != null) {
+                        found[addr] = Tv(si.serviceName, addr)
+                        log("TV found: ${si.serviceName} at $addr")
+                    }
+                    resolving = false
+                    nextResolve()
+                }
+            })
+        } catch (e: Exception) {
+            log("Resolve error: $e")
+            resolving = false
+        }
+    }
+
+    private fun askIp(then: (Tv) -> Unit) {
+        val e = EditText(this).apply {
+            hint = "e.g. 192.168.1.50"
+            inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
+        }
+        AlertDialog.Builder(this).setTitle("TV IP address (TV Settings > Network)").setView(e)
+            .setPositiveButton("OK") { _, _ ->
+                val ip = e.text.toString().trim()
+                if (ip.isNotEmpty()) then(Tv("TV $ip", ip))
+            }
+            .setNegativeButton("Cancel", null).show()
+    }
+
+    private fun pairTv() {
+        val list = (found.values + saved()).distinctBy { it.host }
+        val items = list.map { it.name + "  (" + it.host + ")" } + "Enter IP address..."
+        if (list.isEmpty()) toast("Still searching. If your TV doesn't appear, use Enter IP address.")
+        AlertDialog.Builder(this).setTitle("Pair which TV?")
+            .setItems(items.toTypedArray()) { _, i ->
+                if (i < list.size) pair(list[i]) else askIp { pair(it) }
+            }.show()
+    }
+
+    private fun connectTv() {
+        val list = saved()
+        if (list.isEmpty()) { toast("No paired TV yet. Tap Pair TV first."); return }
+        if (list.size == 1) { connectRemote(list[0]); return }
+        AlertDialog.Builder(this).setTitle("Connect to")
+            .setItems(list.map { it.name + "  (" + it.host + ")" }.toTypedArray()) { _, i -> connectRemote(list[i]) }
+            .show()
+    }
+
+    private fun autoConnect() {
+        if (ready || connecting) return
+        val last = prefs.getString("last", null) ?: return
+        val tv = saved().firstOrNull { it.host == last } ?: return
+        log("Auto-connecting to ${tv.name}")
+        connectRemote(tv)
+    }
+
+    private fun help() {
+        AlertDialog.Builder(this).setTitle("Help")
+            .setMessage(
+                "1. Put the phone and the TV on the same Wi-Fi, and turn the TV on.\n" +
+                "2. Tap Pair TV and choose your TV (or Enter IP address: TV Settings > Network).\n" +
+                "3. A 6-character code appears on the TV. Type it here and tap OK.\n" +
+                "4. After that the app connects by itself. Use Connect if it drops.\n\n" +
+                "To type: write or dictate in the keyboard box, then tap Send.\n\n" +
+                "If anything fails, open the Log tab, tap Copy and send it to Claude."
+            )
+            .setPositiveButton("OK", null).show()
+    }
+
+    private fun setStatus(t: String, c: Int) {
+        log("STATUS: $t")
+        runOnUiThread {
+            status.text = t
+            dot.background = rect(c, 0f, true)
+        }
+    }
+
+    private fun toast(t: String) = runOnUiThread { Toast.makeText(this, t, Toast.LENGTH_LONG).show() }
+
+    // ---------- Activity ----------
     override fun onCreate(b: Bundle?) {
         super.onCreate(b)
         val prev = try { if (logFile.exists()) logFile.readText().takeLast(6000) else "" } catch (e: Exception) { "" }
@@ -146,220 +578,16 @@ class MainActivity : Activity() {
         window.navigationBarColor = Color.parseColor("#141A33")
         buildUi()
         if (prev.isNotBlank()) log("--- previous session ---\n" + prev.trimEnd() + "\n--- end previous session ---")
-        log("App started")
-        val need = needed()
-        if (need.isNotEmpty()) {
-            log("Asking for Bluetooth permissions: " + need.joinToString { it.substringAfterLast('.') })
-            requestPermissions(need, 1)
-        } else setup()
-    }
-
-    private fun needed(): Array<String> =
-        if (Build.VERSION.SDK_INT >= 31)
-            arrayOf(
-                Manifest.permission.BLUETOOTH_CONNECT,
-                Manifest.permission.BLUETOOTH_ADVERTISE,
-                Manifest.permission.BLUETOOTH_SCAN
-            ).filter { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }.toTypedArray()
-        else emptyArray()
-
-    override fun onRequestPermissionsResult(c: Int, p: Array<out String>, r: IntArray) {
-        for (i in p.indices) log("Permission ${p[i].substringAfterLast('.')} granted=${r.getOrNull(i) == PackageManager.PERMISSION_GRANTED}")
-        val ok = Build.VERSION.SDK_INT < 31 || checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED
-        if (ok) setup() else setStatus("Bluetooth permission is needed. Allow it in app settings.", RED)
-    }
-
-    private fun setup() {
+        log("App started (Wi-Fi version)")
         log("Device: ${Build.MANUFACTURER} ${Build.MODEL}, Android ${Build.VERSION.RELEASE} (SDK ${Build.VERSION.SDK_INT})")
-        adapter = (getSystemService(BLUETOOTH_SERVICE) as BluetoothManager).adapter
-        val a = adapter
-        if (a == null) { log("ERROR: no Bluetooth adapter"); setStatus("No Bluetooth on this phone", RED); return }
-        log("Adapter name=${a.name} enabled=${a.isEnabled}")
-        if (!a.isEnabled) { setStatus("Turn Bluetooth on, then reopen the app.", RED); return }
-        val bonded = a.bondedDevices.toList()
-        log("Paired devices: ${bonded.size}")
-        bonded.forEach { log("  " + describe(it)) }
-        val ok = a.getProfileProxy(this, object : BluetoothProfile.ServiceListener {
-            override fun onServiceConnected(profile: Int, proxy: BluetoothProfile) {
-                log("HID service connected")
-                val h = proxy as BluetoothHidDevice
-                hid = h
-                val sdp = BluetoothHidDeviceAppSdpSettings(
-                    "Phone Remote", "TV remote", "Me", BluetoothHidDevice.SUBCLASS1_COMBO, desc
-                )
-                val reg = h.registerApp(sdp, null, null, cbExec, cb)
-                log("registerApp() returned $reg")
-                if (!reg) setStatus("Phone refused the remote setup. Restart Bluetooth and retry.", RED)
-            }
-            override fun onServiceDisconnected(profile: Int) { log("HID service disconnected"); hid = null }
-        }, BluetoothProfile.HID_DEVICE)
-        log("getProfileProxy(HID_DEVICE) returned $ok")
-        if (!ok) setStatus("This phone does not support the Bluetooth keyboard feature", RED)
+        setStatus("Not connected. Tap Pair TV the first time.", Color.GRAY)
+        net.execute { initKeys() }
+        startDiscovery()
     }
 
-    private fun st(s: Int) = when (s) {
-        0 -> "DISCONNECTED"; 1 -> "CONNECTING"; 2 -> "CONNECTED"; 3 -> "DISCONNECTING"; else -> "STATE_$s"
-    }
-
-    private fun bond(s: Int) = when (s) { 10 -> "NOT_BONDED"; 11 -> "BONDING"; 12 -> "BONDED"; else -> "$s" }
-
-    private fun describe(d: BluetoothDevice): String {
-        val cls = d.bluetoothClass?.deviceClass ?: 0
-        val u = d.uuids?.joinToString(",") { it.uuid.toString().substring(4, 8) } ?: "none"
-        return "${d.name ?: "?"} [${d.address}] bond=${bond(d.bondState)} type=${d.type} class=0x${Integer.toHexString(cls)} uuids=$u"
-    }
-
-    private fun connectTo(d: BluetoothDevice) {
-        val h = hid
-        if (h == null) { log("connectTo: HID not ready"); toast("Bluetooth remote is not ready yet"); return }
-        pending = d
-        prefs.edit().putString("last", d.address).apply()
-        setStatus("Connecting to " + (d.name ?: d.address) + "...", AMBER)
-        log("Connecting to " + describe(d))
-        log("Current state=${st(h.getConnectionState(d))}, connected devices=${h.connectedDevices.size}")
-        val r = h.connect(d)
-        log("connect() returned $r")
-        if (!r) {
-            pending = null
-            setStatus("Phone refused to start connecting. Open the Log tab.", RED)
-            return
-        }
-        main.postDelayed({
-            if (pending == d && host != d) {
-                pending = null
-                log("Timed out after 12s waiting for the TV to accept")
-                setStatus("TV did not accept. Open the Log tab, or tap Help.", RED)
-            }
-        }, 12000)
-    }
-
-    private fun setStatus(t: String, c: Int) {
-        log("STATUS: $t")
-        runOnUiThread {
-            status.text = t
-            dot.background = rect(c, 0f, true)
-        }
-    }
-
-    private fun toast(t: String) = Toast.makeText(this, t, Toast.LENGTH_LONG).show()
-
-    private fun connected(): Boolean {
-        if (hid == null || host == null) { toast("Not connected. Tap Choose TV."); return false }
-        return true
-    }
-
-    private fun key(code: Int, mod: Int = 0) {
-        if (!connected()) return
-        val h = hid!!; val d = host!!
-        typer.execute {
-            val a = h.sendReport(d, 1, byteArrayOf(mod.toByte(), 0, code.toByte(), 0, 0, 0, 0, 0))
-            Thread.sleep(30)
-            val b = h.sendReport(d, 1, ByteArray(8))
-            Thread.sleep(30)
-            if (!a || !b) log("key 0x%02X send failed (press=$a release=$b)".format(code))
-        }
-    }
-
-    private fun media(usage: Int) {
-        if (!connected()) return
-        val h = hid!!; val d = host!!
-        typer.execute {
-            val a = h.sendReport(d, 2, byteArrayOf((usage and 0xFF).toByte(), (usage shr 8).toByte()))
-            Thread.sleep(30)
-            val b = h.sendReport(d, 2, byteArrayOf(0, 0))
-            Thread.sleep(30)
-            if (!a || !b) log("media 0x%X send failed (press=$a release=$b)".format(usage))
-        }
-    }
-
-    private fun map(c: Char): Pair<Int, Int>? = when (c) {
-        in 'a'..'z' -> (0x04 + (c - 'a')) to 0
-        in 'A'..'Z' -> (0x04 + (c - 'A')) to 2
-        in '1'..'9' -> (0x1E + (c - '1')) to 0
-        '0' -> 0x27 to 0
-        ' ' -> 0x2C to 0
-        '\n' -> 0x28 to 0
-        '.' -> 0x37 to 0
-        ',' -> 0x36 to 0
-        '-' -> 0x2D to 0
-        '/' -> 0x38 to 0
-        ';' -> 0x33 to 0
-        '\'' -> 0x34 to 0
-        '!' -> 0x1E to 2
-        '@' -> 0x1F to 2
-        '?' -> 0x38 to 2
-        ':' -> 0x33 to 2
-        '_' -> 0x2D to 2
-        '(' -> 0x26 to 2
-        ')' -> 0x27 to 2
-        else -> null
-    }
-
-    private fun sendText() {
-        val t = input.text.toString()
-        if (t.isEmpty() || !connected()) return
-        var skipped = 0
-        for (c in t) { val m = map(c); if (m == null) skipped++ else key(m.first, m.second) }
-        log("Typed ${t.length} characters ($skipped skipped)")
-        if (skipped > 0) toast("$skipped unsupported characters skipped")
-        input.setText("")
-    }
-
-    private fun pickTv() {
-        val list = adapter?.bondedDevices?.toList() ?: emptyList()
-        if (list.isEmpty()) {
-            toast("No paired devices yet. Tap Pair TV first.")
-            return
-        }
-        val names = list.map { it.name ?: it.address }.toTypedArray()
-        AlertDialog.Builder(this).setTitle("Choose TV")
-            .setItems(names) { _, i -> connectTo(list[i]) }
-            .show()
-    }
-
-    private fun pairTv() {
-        log("Pair TV tapped")
-        toast("Allow 'discoverable', then on the TV pick this phone in Bluetooth / Pair remote or accessory.")
-        try {
-            startActivityForResult(
-                Intent(BluetoothAdapter.ACTION_REQUEST_DISCOVERABLE)
-                    .putExtra(BluetoothAdapter.EXTRA_DISCOVERABLE_DURATION, 300), 7
-            )
-        } catch (e: Exception) {
-            log("Discoverable request failed: $e")
-            openBtSettings()
-        }
-    }
-
-    @Suppress("DEPRECATION")
-    override fun onActivityResult(req: Int, res: Int, d: Intent?) {
-        super.onActivityResult(req, res, d)
-        if (req == 7) {
-            log("Discoverable result=$res (0 means denied)")
-            if (res == RESULT_CANCELED) {
-                toast("Discoverable was blocked. Opening Bluetooth settings: stay on that screen while the TV searches.")
-                openBtSettings()
-            } else setStatus("Phone is visible. On the TV, search for Bluetooth devices and pick this phone.", AMBER)
-        }
-    }
-
-    private fun openBtSettings() {
-        try { startActivity(Intent(Settings.ACTION_BLUETOOTH_SETTINGS)) } catch (e: Exception) { log("Cannot open settings: $e") }
-    }
-
-    private fun help() {
-        AlertDialog.Builder(this).setTitle("If it won't connect")
-            .setMessage(
-                "1. Phone Settings > Bluetooth: forget (unpair) the TV.\n" +
-                "2. On the TV, remove this phone from its Bluetooth / remote list.\n" +
-                "3. Open this app first and wait for \"Ready\".\n" +
-                "4. Tap Pair TV, then on the TV search for Bluetooth devices and pick this phone.\n" +
-                "5. Back in the app, tap Choose TV and select the TV.\n\n" +
-                "Keep this app open while using it. If it still fails, open the Log tab, tap Copy and send the log to Claude."
-            )
-            .setPositiveButton("OK", null)
-            .setNeutralButton("Bluetooth settings") { _, _ -> startActivity(Intent(Settings.ACTION_BLUETOOTH_SETTINGS)) }
-            .show()
+    override fun onResume() {
+        super.onResume()
+        net.execute { autoConnect() }
     }
 
     // ---------- Log ----------
@@ -498,10 +726,10 @@ class MainActivity : Activity() {
             press(t, true) { key(code) }
             frame.addView(t)
         }
-        arrow("▲", Gravity.TOP or Gravity.CENTER_HORIZONTAL, 0x52)
-        arrow("▼", Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL, 0x51)
-        arrow("◀", Gravity.START or Gravity.CENTER_VERTICAL, 0x50)
-        arrow("▶", Gravity.END or Gravity.CENTER_VERTICAL, 0x4F)
+        arrow("▲", Gravity.TOP or Gravity.CENTER_HORIZONTAL, 19)
+        arrow("▼", Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL, 20)
+        arrow("◀", Gravity.START or Gravity.CENTER_VERTICAL, 21)
+        arrow("▶", Gravity.END or Gravity.CENTER_VERTICAL, 22)
         val ok = TextView(this).apply {
             text = "OK"
             textSize = 22f
@@ -511,7 +739,7 @@ class MainActivity : Activity() {
             background = keyBg(PURPLE, 0f, true)
             layoutParams = FrameLayout.LayoutParams(dp(100), dp(100), Gravity.CENTER)
         }
-        press(ok, false) { key(0x28) }
+        press(ok, false) { key(23) }
         frame.addView(ok)
         return frame
     }
@@ -561,7 +789,7 @@ class MainActivity : Activity() {
             textSize = 15f
         }
         val title = TextView(this).apply {
-            text = "Phone Remote  v3"
+            text = "Phone Remote  v4 Wi-Fi"
             textSize = 26f
             setTextColor(Color.WHITE)
             setTypeface(typeface, Typeface.BOLD)
@@ -590,13 +818,13 @@ class MainActivity : Activity() {
             setPadding(dp(16), dp(16), dp(16), dp(24))
             addView(title)
             addView(card, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { bottomMargin = dp(10) })
-            addView(row(pill("Pair TV", PURPLE) { pairTv() }, pill("Choose TV", BLUE) { pickTv() }, pill("Help") { help() }))
+            addView(row(pill("Pair TV", PURPLE) { pairTv() }, pill("Connect", BLUE) { connectTv() }, pill("Help") { help() }))
             addView(dpad())
-            addView(row(pill("Back", ORANGE) { media(0x224) }, pill("Home", TEAL) { media(0x223) }))
-            addView(row(pill("Vol -", BLUE, true) { media(0xEA) }, pill("Mute", RED) { media(0xE2) }, pill("Vol +", BLUE, true) { media(0xE9) }))
+            addView(row(pill("Back", ORANGE) { key(4) }, pill("Home", TEAL) { key(3) }, pill("Power", RED) { key(26) }))
+            addView(row(pill("Vol -", BLUE, true) { key(25) }, pill("Mute", SLATE) { key(164) }, pill("Vol +", BLUE, true) { key(24) }))
             addView(label("KEYBOARD  (tap the mic on your keyboard to speak)"))
             addView(input)
-            addView(row(pill("Send", PURPLE) { sendText() }, pill("Delete", AMBER, true) { key(0x2A) }, pill("Enter", GREEN) { key(0x28) }))
+            addView(row(pill("Send", PURPLE) { sendText() }, pill("Delete", AMBER, true) { key(67) }, pill("Enter", GREEN) { key(66) }))
         }
         remoteView = ScrollView(this).apply { isFillViewport = true; addView(remote) }
         logView = buildLogView()
@@ -621,7 +849,8 @@ class MainActivity : Activity() {
 
     override fun onDestroy() {
         log("App closing")
-        hid?.unregisterApp()
+        closeSock()
+        try { nsd.stopServiceDiscovery(disc) } catch (e: Exception) {}
         super.onDestroy()
     }
 }
