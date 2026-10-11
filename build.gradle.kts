@@ -7,11 +7,19 @@ android {
     namespace = "com.tvremote"
     compileSdk = 34
     defaultConfig {
-        applicationId = "com.tvremote"
+        applicationId = "com.tvremote.v3"
         minSdk = 28
         targetSdk = 34
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = 3
+        versionName = "3.0"
+    }
+    signingConfigs {
+        getByName("debug") {
+            storeFile = file("debug.keystore")
+            storePassword = "android"
+            keyAlias = "androiddebugkey"
+            keyPassword = "android"
+        }
     }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17

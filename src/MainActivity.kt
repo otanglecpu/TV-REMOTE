@@ -147,17 +147,25 @@ class MainActivity : Activity() {
         buildUi()
         if (prev.isNotBlank()) log("--- previous session ---\n" + prev.trimEnd() + "\n--- end previous session ---")
         log("App started")
-        if (Build.VERSION.SDK_INT >= 31 &&
-            checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED
-        ) {
-            log("Asking for Bluetooth permission")
-            requestPermissions(arrayOf(Manifest.permission.BLUETOOTH_CONNECT), 1)
+        val need = needed()
+        if (need.isNotEmpty()) {
+            log("Asking for Bluetooth permissions: " + need.joinToString { it.substringAfterLast('.') })
+            requestPermissions(need, 1)
         } else setup()
     }
 
+    private fun needed(): Array<String> =
+        if (Build.VERSION.SDK_INT >= 31)
+            arrayOf(
+                Manifest.permission.BLUETOOTH_CONNECT,
+                Manifest.permission.BLUETOOTH_ADVERTISE,
+                Manifest.permission.BLUETOOTH_SCAN
+            ).filter { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }.toTypedArray()
+        else emptyArray()
+
     override fun onRequestPermissionsResult(c: Int, p: Array<out String>, r: IntArray) {
-        val ok = r.isNotEmpty() && r[0] == PackageManager.PERMISSION_GRANTED
-        log("Bluetooth permission granted=$ok")
+        for (i in p.indices) log("Permission ${p[i].substringAfterLast('.')} granted=${r.getOrNull(i) == PackageManager.PERMISSION_GRANTED}")
+        val ok = Build.VERSION.SDK_INT < 31 || checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED
         if (ok) setup() else setStatus("Bluetooth permission is needed. Allow it in app settings.", RED)
     }
 
@@ -310,12 +318,33 @@ class MainActivity : Activity() {
     }
 
     private fun pairTv() {
-        log("Pair TV tapped: phone made discoverable for 5 minutes")
-        toast("Now on the TV: Settings > Remote & Accessories > Pair remote or accessory, then pick this phone.")
-        startActivity(
-            Intent(BluetoothAdapter.ACTION_REQUEST_DISCOVERABLE)
-                .putExtra(BluetoothAdapter.EXTRA_DISCOVERABLE_DURATION, 300)
-        )
+        log("Pair TV tapped")
+        toast("Allow 'discoverable', then on the TV pick this phone in Bluetooth / Pair remote or accessory.")
+        try {
+            startActivityForResult(
+                Intent(BluetoothAdapter.ACTION_REQUEST_DISCOVERABLE)
+                    .putExtra(BluetoothAdapter.EXTRA_DISCOVERABLE_DURATION, 300), 7
+            )
+        } catch (e: Exception) {
+            log("Discoverable request failed: $e")
+            openBtSettings()
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    override fun onActivityResult(req: Int, res: Int, d: Intent?) {
+        super.onActivityResult(req, res, d)
+        if (req == 7) {
+            log("Discoverable result=$res (0 means denied)")
+            if (res == RESULT_CANCELED) {
+                toast("Discoverable was blocked. Opening Bluetooth settings: stay on that screen while the TV searches.")
+                openBtSettings()
+            } else setStatus("Phone is visible. On the TV, search for Bluetooth devices and pick this phone.", AMBER)
+        }
+    }
+
+    private fun openBtSettings() {
+        try { startActivity(Intent(Settings.ACTION_BLUETOOTH_SETTINGS)) } catch (e: Exception) { log("Cannot open settings: $e") }
     }
 
     private fun help() {
@@ -532,7 +561,7 @@ class MainActivity : Activity() {
             textSize = 15f
         }
         val title = TextView(this).apply {
-            text = "Phone Remote"
+            text = "Phone Remote  v3"
             textSize = 26f
             setTextColor(Color.WHITE)
             setTypeface(typeface, Typeface.BOLD)
