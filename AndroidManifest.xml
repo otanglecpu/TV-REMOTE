@@ -6,7 +6,7 @@
     <application
         android:label="Phone Remote"
         android:allowBackup="false"
-        android:theme="@android:style/Theme.DeviceDefault.Light">
+        android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
         <activity android:name="com.tvremote.MainActivity" android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
