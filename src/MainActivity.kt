@@ -35,7 +35,13 @@ import java.math.BigInteger
 import java.net.Inet4Address
 import java.net.InetSocketAddress
 import java.net.Socket
+import java.security.KeyFactory
 import java.security.KeyPairGenerator
+import java.security.PublicKey
+import java.security.Signature
+import java.security.cert.CertificateFactory
+import java.security.spec.PKCS8EncodedKeySpec
+import java.io.ByteArrayInputStream
 import java.security.KeyStore
 import java.security.MessageDigest
 import java.security.Principal
@@ -194,29 +200,53 @@ class MainActivity : Activity() {
         override fun getAcceptedIssuers(): Array<X509Certificate> = arrayOf()
     }
 
+    private fun der(tag: Int, vararg parts: ByteArray): ByteArray {
+        val body = ByteArrayOutputStream()
+        parts.forEach { body.write(it) }
+        val c = body.toByteArray()
+        val o = ByteArrayOutputStream()
+        o.write(tag)
+        if (c.size < 128) o.write(c.size)
+        else if (c.size < 256) { o.write(0x81); o.write(c.size) }
+        else { o.write(0x82); o.write(c.size shr 8); o.write(c.size and 0xFF) }
+        o.write(c)
+        return o.toByteArray()
+    }
+
+    private fun selfSigned(pub: PublicKey, priv: PrivateKey): X509Certificate {
+        val algId = der(0x30,
+            der(0x06, byteArrayOf(0x2A, 0x86.toByte(), 0x48, 0x86.toByte(), 0xF7.toByte(), 0x0D, 0x01, 0x01, 0x0B)),
+            byteArrayOf(0x05, 0x00))
+        val name = der(0x30, der(0x31, der(0x30,
+            der(0x06, byteArrayOf(0x55, 0x04, 0x03)), der(0x0C, "phone-remote".toByteArray()))))
+        val validity = der(0x30, der(0x17, "250101000000Z".toByteArray()), der(0x17, "491231235959Z".toByteArray()))
+        val tbs = der(0x30,
+            byteArrayOf(0xA0.toByte(), 0x03, 0x02, 0x01, 0x02),
+            der(0x02, byteArrayOf(0x01)),
+            algId, name, validity, name, pub.encoded)
+        val sg = Signature.getInstance("SHA256withRSA")
+        sg.initSign(priv)
+        sg.update(tbs)
+        val sig = sg.sign()
+        val cert = der(0x30, tbs, algId, der(0x03, byteArrayOf(0), sig))
+        return CertificateFactory.getInstance("X.509").generateCertificate(ByteArrayInputStream(cert)) as X509Certificate
+    }
+
     private fun initKeys() {
         try {
-            val ks = KeyStore.getInstance("AndroidKeyStore")
-            ks.load(null)
-            if (!ks.containsAlias(ALIAS)) {
-                val kpg = KeyPairGenerator.getInstance(KeyProperties.KEY_ALGORITHM_RSA, "AndroidKeyStore")
-                kpg.initialize(
-                    KeyGenParameterSpec.Builder(ALIAS, KeyProperties.PURPOSE_SIGN)
-                        .setKeySize(2048)
-                        .setDigests(
-                            KeyProperties.DIGEST_SHA256, KeyProperties.DIGEST_SHA384,
-                            KeyProperties.DIGEST_SHA512, KeyProperties.DIGEST_SHA1, KeyProperties.DIGEST_NONE
-                        )
-                        .setSignaturePaddings(KeyProperties.SIGNATURE_PADDING_RSA_PKCS1, KeyProperties.SIGNATURE_PADDING_RSA_PSS)
-                        .setCertificateSubject(X500Principal("CN=phone-remote"))
-                        .setCertificateSerialNumber(BigInteger.ONE)
-                        .build()
-                )
-                kpg.generateKeyPair()
+            val kf = File(filesDir, "client.key")
+            val cf = File(filesDir, "client.crt")
+            if (!kf.exists() || !cf.exists()) {
+                val kpg = KeyPairGenerator.getInstance("RSA")
+                kpg.initialize(2048)
+                val kp = kpg.generateKeyPair()
+                kf.writeBytes(kp.private.encoded)
+                cf.writeBytes(selfSigned(kp.public, kp.private).encoded)
                 log("Generated a new client key (you will need to pair again)")
             }
-            privateKey = ks.getKey(ALIAS, null) as PrivateKey
-            clientCert = ks.getCertificate(ALIAS) as X509Certificate
+            privateKey = KeyFactory.getInstance("RSA").generatePrivate(PKCS8EncodedKeySpec(kf.readBytes()))
+            clientCert = CertificateFactory.getInstance("X.509")
+                .generateCertificate(ByteArrayInputStream(cf.readBytes())) as X509Certificate
             log("Client key ready")
         } catch (e: Exception) {
             log("KEY ERROR: $e")
