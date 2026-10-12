@@ -58,6 +58,7 @@ import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
 import javax.net.ssl.SSLContext
 import javax.net.ssl.SSLSocket
+import javax.net.ssl.TrustManager
 import javax.net.ssl.X509KeyManager
 import javax.net.ssl.X509TrustManager
 import javax.security.auth.x500.X500Principal
@@ -75,6 +76,7 @@ class MainActivity : Activity() {
     private val GREEN = Color.parseColor("#2ECC71")
     private val AMBER = Color.parseColor("#FFB020")
     private val SLATE = Color.parseColor("#3A4166")
+    private val ROSE = Color.parseColor("#B04A7A")
 
     data class Tv(val name: String, val host: String)
 
@@ -102,6 +104,8 @@ class MainActivity : Activity() {
     @Volatile private var ready = false
     @Volatile private var connecting = false
     @Volatile private var closing = false
+    @Volatile private var manualOff = false
+    @Volatile private var current: Tv? = null
     private val codeQ = LinkedBlockingQueue<String>()
     private val found = ConcurrentHashMap<String, Tv>()
     private val resolveQ = ConcurrentLinkedQueue<NsdServiceInfo>()
@@ -254,11 +258,24 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun tls(host: String, port: Int): SSLSocket {
+    private fun fp(c: X509Certificate): String =
+        MessageDigest.getInstance("SHA-256").digest(c.encoded).joinToString("") { "%02x".format(it) }
+
+    private fun pinned(pin: String): X509TrustManager = object : X509TrustManager {
+        override fun checkClientTrusted(c: Array<X509Certificate>?, a: String?) {}
+        override fun checkServerTrusted(c: Array<X509Certificate>?, a: String?) {
+            val got = c?.firstOrNull()?.let { fp(it) }
+            if (got != pin) throw java.security.cert.CertificateException("TV certificate changed")
+        }
+        override fun getAcceptedIssuers(): Array<X509Certificate> = arrayOf()
+    }
+
+    private fun tls(host: String, port: Int, pin: String? = null): SSLSocket {
         val k = privateKey ?: throw IOException("no client key")
         val c = clientCert ?: throw IOException("no client certificate")
         val ctx = SSLContext.getInstance("TLSv1.2")
-        ctx.init(arrayOf(FixedKm(k, arrayOf(c))), arrayOf(trustAll), null)
+        val tm: TrustManager = if (pin == null) trustAll else pinned(pin)
+        ctx.init(arrayOf(FixedKm(k, arrayOf(c))), arrayOf(tm), null)
         val s = ctx.socketFactory.createSocket() as SSLSocket
         s.connect(InetSocketAddress(host, port), 8000)
         s.soTimeout = 20000
@@ -337,6 +354,7 @@ class MainActivity : Activity() {
                 writeFrame(out, pmsg(40, Pb.f(1, secret)))
                 val r = recv("secret")
                 log("Pairing finished, secret ack present=${r.containsKey(41)}")
+                prefs.edit().putString("pin_" + tv.name, fp(serverCert)).apply()
                 setStatus("Paired. Connecting...", GREEN)
                 try { s.close() } catch (e: Exception) {}
                 Thread.sleep(800)
@@ -354,29 +372,46 @@ class MainActivity : Activity() {
         (prefs.getString("saved", "") ?: "").split("\n").filter { it.contains("\t") }
             .map { val p = it.split("\t"); Tv(p[1], p[0]) }
 
+    private fun saveList(l: List<Tv>) {
+        prefs.edit().putString("saved", l.joinToString("\n") { it.host + "\t" + it.name }).apply()
+    }
+
     private fun saveTv(tv: Tv) {
-        val l = saved().filter { it.host != tv.host } + tv
-        prefs.edit().putString("saved", l.joinToString("\n") { it.host + "\t" + it.name })
-            .putString("last", tv.host).apply()
+        saveList(saved().filter { it.name != tv.name && it.host != tv.host } + tv)
+        prefs.edit().putString("last", tv.name).apply()
+    }
+
+    private fun resolveHost(tv: Tv): Tv {
+        val f = found.values.firstOrNull { it.name == tv.name }
+        return if (f != null && f.host != tv.host) { log("TV address changed to ${f.host}"); tv.copy(host = f.host) } else tv
     }
 
     private fun closeSock() {
         closing = true
         ready = false
+        current = null
         try { sock?.close() } catch (e: Exception) {}
         sock = null
     }
 
-    private fun connectRemote(tv: Tv) {
+    private fun connectRemote(tv0: Tv) {
         if (connecting) { log("Already connecting"); return }
         connecting = true
+        manualOff = false
         closeSock()
         closing = false
+        val tv = resolveHost(tv0)
         setStatus("Connecting to ${tv.name}...", AMBER)
         Thread {
             var wasReady = false
+            var pinProblem = false
             try {
-                val s = tls(tv.host, 6466)
+                val pin = prefs.getString("pin_" + tv.name, null)
+                val s = tls(tv.host, 6466, pin)
+                if (pin == null) {
+                    prefs.edit().putString("pin_" + tv.name, fp(s.session.peerCertificates[0] as X509Certificate)).apply()
+                    log("Remembered this TV's certificate")
+                }
                 s.soTimeout = 0
                 sock = s
                 val inp = s.inputStream
@@ -395,8 +430,8 @@ class MainActivity : Activity() {
                             if (!ready) { wasReady = true; onReady(tv) }
                         }
                         m.containsKey(8) -> {
-                            val p = Pb.parse(m[8]!![0] as ByteArray)
-                            val v = p[1]?.firstOrNull() as? Long ?: 0L
+                            val pp = Pb.parse(m[8]!![0] as ByteArray)
+                            val v = pp[1]?.firstOrNull() as? Long ?: 0L
                             writeFrame(s.outputStream, Pb.f(9, Pb.f(1, v)))
                         }
                         m.containsKey(40) -> { log("TV sent start"); if (!ready) { wasReady = true; onReady(tv) } }
@@ -405,11 +440,14 @@ class MainActivity : Activity() {
                     }
                 }
             } catch (e: Exception) {
+                pinProblem = generateSequence<Throwable>(e) { it.cause }.any { it.message?.contains("certificate changed") == true }
                 if (!closing) log("Connection ended: $e")
             }
             ready = false
+            current = null
             if (!closing) {
-                if (wasReady) setStatus("Disconnected. Tap Connect.", AMBER)
+                if (pinProblem) setStatus("This TV's identity changed, so I did not connect. If you reset the TV, forget it in Devices and pair again.", RED)
+                else if (wasReady) setStatus("Disconnected. Tap Connect.", AMBER)
                 else setStatus("Could not connect. If this TV was never paired, tap Pair TV. Otherwise check the TV is on and on the same Wi-Fi.", RED)
             }
             connecting = false
@@ -418,6 +456,7 @@ class MainActivity : Activity() {
 
     private fun onReady(tv: Tv) {
         ready = true
+        current = tv
         saveTv(tv)
         setStatus("Connected to ${tv.name}", GREEN)
     }
@@ -564,11 +603,43 @@ class MainActivity : Activity() {
     }
 
     private fun autoConnect() {
-        if (ready || connecting) return
+        if (ready || connecting || manualOff) return
         val last = prefs.getString("last", null) ?: return
-        val tv = saved().firstOrNull { it.host == last } ?: return
+        val tv = saved().firstOrNull { it.name == last || it.host == last } ?: return
         log("Auto-connecting to ${tv.name}")
         connectRemote(tv)
+    }
+
+    private fun disconnectTv() {
+        manualOff = true
+        closeSock()
+        setStatus("Disconnected. Tap Connect to reconnect.", AMBER)
+    }
+
+    private fun devices() {
+        val list = saved()
+        if (list.isEmpty()) { toast("No paired TVs yet."); return }
+        val items = list.map { (if (ready && current?.name == it.name) "● " else "○ ") + it.name + "  (" + it.host + ")" }
+        AlertDialog.Builder(this).setTitle("Paired TVs  (● = connected)")
+            .setItems(items.toTypedArray()) { _, i -> deviceMenu(list[i]) }
+            .setNegativeButton("Close", null).show()
+    }
+
+    private fun deviceMenu(tv: Tv) {
+        val isCur = ready && current?.name == tv.name
+        val opts = arrayOf(if (isCur) "Disconnect" else "Connect", "Forget this TV")
+        AlertDialog.Builder(this).setTitle(tv.name).setItems(opts) { _, i ->
+            if (i == 0) { if (isCur) disconnectTv() else connectRemote(tv) } else forget(tv)
+        }.show()
+    }
+
+    private fun forget(tv: Tv) {
+        if (current?.name == tv.name) disconnectTv()
+        saveList(saved().filter { it.name != tv.name })
+        prefs.edit().remove("pin_" + tv.name).apply()
+        if (prefs.getString("last", null) == tv.name) prefs.edit().remove("last").apply()
+        log("Forgot ${tv.name}")
+        toast("Forgotten. You can also remove this phone from the TV's remote list in the TV settings.")
     }
 
     private fun help() {
@@ -577,7 +648,7 @@ class MainActivity : Activity() {
                 "1. Put the phone and the TV on the same Wi-Fi, and turn the TV on.\n" +
                 "2. Tap Pair TV and choose your TV (or Enter IP address: TV Settings > Network).\n" +
                 "3. A 6-character code appears on the TV. Type it here and tap OK.\n" +
-                "4. After that the app connects by itself. Use Connect if it drops.\n\n" +
+                "4. After that the app connects by itself. Use Connect if it drops, Disconnect to stop it, and Devices to see or forget paired TVs.\n\n" +
                 "To type: write or dictate in the keyboard box, then tap Send.\n\n" +
                 "If anything fails, open the Log tab, tap Copy and send it to Claude."
             )
@@ -736,22 +807,21 @@ class MainActivity : Activity() {
     }
 
     private fun dpad(): View {
-        val size = dp(270)
+        val size = dp(215)
         val frame = FrameLayout(this).apply {
             background = grad(Color.parseColor("#2E3480"), Color.parseColor("#171B45"), 0f, true, Color.parseColor("#6C8CFF"))
             layoutParams = LinearLayout.LayoutParams(size, size).apply {
-                gravity = Gravity.CENTER_HORIZONTAL
-                setMargins(0, dp(18), 0, dp(14))
+                setMargins(0, dp(8), dp(8), dp(8))
             }
         }
         fun arrow(sym: String, g: Int, code: Int) {
             val t = TextView(this).apply {
                 text = sym
-                textSize = 28f
+                textSize = 24f
                 setTextColor(Color.WHITE)
                 gravity = Gravity.CENTER
                 background = flatBg()
-                layoutParams = FrameLayout.LayoutParams(dp(86), dp(86), g)
+                layoutParams = FrameLayout.LayoutParams(dp(68), dp(68), g)
             }
             press(t, true) { key(code) }
             frame.addView(t)
@@ -762,16 +832,30 @@ class MainActivity : Activity() {
         arrow("▶", Gravity.END or Gravity.CENTER_VERTICAL, 22)
         val ok = TextView(this).apply {
             text = "OK"
-            textSize = 22f
+            textSize = 20f
             setTextColor(Color.WHITE)
             setTypeface(typeface, Typeface.BOLD)
             gravity = Gravity.CENTER
             background = keyBg(PURPLE, 0f, true)
-            layoutParams = FrameLayout.LayoutParams(dp(100), dp(100), Gravity.CENTER)
+            layoutParams = FrameLayout.LayoutParams(dp(80), dp(80), Gravity.CENTER)
         }
         press(ok, false) { key(23) }
         frame.addView(ok)
         return frame
+    }
+
+    private fun volColumn(): View {
+        fun vb(label: String, c: Int, rep: Boolean, code: Int) = pill(label, c, rep) { key(code) }.apply {
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f)
+                .apply { setMargins(dp(4), dp(4), dp(4), dp(4)) }
+        }
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutParams = LinearLayout.LayoutParams(0, dp(215), 1f)
+            addView(vb("Vol +", BLUE, true, 24))
+            addView(vb("Mute", SLATE, false, 164))
+            addView(vb("Vol -", BLUE, true, 25))
+        }
     }
 
     private fun tab(t: String, f: () -> Unit) = TextView(this).apply {
@@ -819,7 +903,7 @@ class MainActivity : Activity() {
             textSize = 15f
         }
         val title = TextView(this).apply {
-            text = "Phone Remote  v4 Wi-Fi"
+            text = "Phone Remote  v5"
             textSize = 26f
             setTextColor(Color.WHITE)
             setTypeface(typeface, Typeface.BOLD)
@@ -848,10 +932,10 @@ class MainActivity : Activity() {
             setPadding(dp(16), dp(16), dp(16), dp(24))
             addView(title)
             addView(card, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { bottomMargin = dp(10) })
-            addView(row(pill("Pair TV", PURPLE) { pairTv() }, pill("Connect", BLUE) { connectTv() }, pill("Help") { help() }))
-            addView(dpad())
+            addView(row(pill("Pair TV", PURPLE) { pairTv() }, pill("Connect", BLUE) { connectTv() }, pill("Disconnect", ROSE) { disconnectTv() }))
+            addView(row(pill("Devices", TEAL) { devices() }, pill("Help") { help() }))
+            addView(row(dpad(), volColumn()).apply { gravity = Gravity.CENTER_VERTICAL })
             addView(row(pill("Back", ORANGE) { key(4) }, pill("Home", TEAL) { key(3) }, pill("Power", RED) { key(26) }))
-            addView(row(pill("Vol -", BLUE, true) { key(25) }, pill("Mute", SLATE) { key(164) }, pill("Vol +", BLUE, true) { key(24) }))
             addView(label("KEYBOARD  (tap the mic on your keyboard to speak)"))
             addView(input)
             addView(row(pill("Send", PURPLE) { sendText() }, pill("Delete", AMBER, true) { key(67) }, pill("Enter", GREEN) { key(66) }))
