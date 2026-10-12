@@ -105,6 +105,7 @@ class MainActivity : Activity() {
     @Volatile private var connecting = false
     @Volatile private var closing = false
     @Volatile private var manualOff = false
+    private val gen = java.util.concurrent.atomic.AtomicInteger(0)
     @Volatile private var current: Tv? = null
     private val codeQ = LinkedBlockingQueue<String>()
     private val found = ConcurrentHashMap<String, Tv>()
@@ -395,11 +396,12 @@ class MainActivity : Activity() {
     }
 
     private fun connectRemote(tv0: Tv) {
-        if (connecting) { log("Already connecting"); return }
+        if (connecting && !closing) { log("Already connecting"); return }
         connecting = true
         manualOff = false
         closeSock()
         closing = false
+        val my = gen.incrementAndGet()
         val tv = resolveHost(tv0)
         setStatus("Connecting to ${tv.name}...", AMBER)
         Thread {
@@ -443,6 +445,7 @@ class MainActivity : Activity() {
                 pinProblem = generateSequence<Throwable>(e) { it.cause }.any { it.message?.contains("certificate changed") == true }
                 if (!closing) log("Connection ended: $e")
             }
+            if (gen.get() != my) return@Thread
             ready = false
             current = null
             if (!closing) {
@@ -603,7 +606,7 @@ class MainActivity : Activity() {
     }
 
     private fun autoConnect() {
-        if (ready || connecting || manualOff) return
+        if (ready || (connecting && !closing) || manualOff) return
         val last = prefs.getString("last", null) ?: return
         val tv = saved().firstOrNull { it.name == last || it.host == last } ?: return
         log("Auto-connecting to ${tv.name}")
@@ -684,6 +687,15 @@ class MainActivity : Activity() {
         setStatus("Not connected. Tap Pair TV the first time.", Color.GRAY)
         net.execute { initKeys() }
         startDiscovery()
+    }
+
+    override fun onStop() {
+        super.onStop()
+        if (!isChangingConfigurations && !manualOff && (ready || connecting)) {
+            log("App left the screen: closing the TV connection")
+            closeSock()
+            setStatus("Paused. It reconnects when you return.", Color.GRAY)
+        }
     }
 
     override fun onResume() {
@@ -903,7 +915,7 @@ class MainActivity : Activity() {
             textSize = 15f
         }
         val title = TextView(this).apply {
-            text = "Phone Remote  v5"
+            text = "Phone Remote  v5.1"
             textSize = 26f
             setTextColor(Color.WHITE)
             setTypeface(typeface, Typeface.BOLD)

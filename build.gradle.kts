@@ -10,8 +10,8 @@ android {
         applicationId = "com.tvremote.wifi"
         minSdk = 28
         targetSdk = 34
-        versionCode = 5
-        versionName = "5.0"
+        versionCode = 6
+        versionName = "5.1"
     }
     signingConfigs {
         getByName("debug") {
@@ -30,6 +30,7 @@ android {
         getByName("main") {
             manifest.srcFile("AndroidManifest.xml")
             java.srcDirs("src")
+            res.srcDirs("res")
         }
     }
 }
