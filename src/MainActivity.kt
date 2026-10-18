@@ -105,6 +105,9 @@ class MainActivity : Activity() {
     @Volatile private var connecting = false
     @Volatile private var closing = false
     @Volatile private var manualOff = false
+    @Volatile private var imeActive = false
+    @Volatile private var imeCounter = 0
+    @Volatile private var fieldCounter = 0
     private val gen = java.util.concurrent.atomic.AtomicInteger(0)
     @Volatile private var current: Tv? = null
     private val codeQ = LinkedBlockingQueue<String>()
@@ -402,6 +405,9 @@ class MainActivity : Activity() {
         closeSock()
         closing = false
         val my = gen.incrementAndGet()
+        imeActive = false
+        imeCounter = 0
+        fieldCounter = 0
         val tv = resolveHost(tv0)
         setStatus("Connecting to ${tv.name}...", AMBER)
         Thread {
@@ -437,6 +443,26 @@ class MainActivity : Activity() {
                             writeFrame(s.outputStream, Pb.f(9, Pb.f(1, v)))
                         }
                         m.containsKey(40) -> { log("TV sent start"); if (!ready) { wasReady = true; onReady(tv) } }
+                        m.containsKey(20) -> {
+                            val k = Pb.parse(m[20]!![0] as ByteArray)
+                            val app = (k[1]?.firstOrNull() as? ByteArray)?.let { Pb.parse(it) }
+                            val tf = (k[2]?.firstOrNull() as? ByteArray)?.let { Pb.parse(it) }
+                            val ic = app?.get(1)?.firstOrNull() as? Long
+                            val fc = tf?.get(1)?.firstOrNull() as? Long
+                            if (ic != null) imeCounter = ic.toInt()
+                            if (fc != null) fieldCounter = fc.toInt()
+                            imeActive = true
+                            log("TV text field update: ime=$ic field=$fc (fields ${k.keys} / app ${app?.keys} / text ${tf?.keys})")
+                        }
+                        m.containsKey(22) -> {
+                            val k = Pb.parse(m[22]!![0] as ByteArray)
+                            val tf = (k[2]?.firstOrNull() as? ByteArray)?.let { Pb.parse(it) }
+                            val fc = tf?.get(1)?.firstOrNull() as? Long
+                            if (fc != null) fieldCounter = fc.toInt()
+                            imeActive = true
+                            log("TV asked to show the keyboard: field=$fc (fields ${k.keys})")
+                        }
+                        m.containsKey(21) -> log("TV sent a text edit (ignored)")
                         m.containsKey(3) -> log("TV sent an error message")
                         else -> log("TV message fields=${m.keys}")
                     }
@@ -505,26 +531,21 @@ class MainActivity : Activity() {
         else -> null
     }
 
+    private fun imeMsg(text: String): ByteArray {
+        val pos = (text.length - 1).toLong()
+        val edit = Pb.f(1, 1L) + Pb.f(2, Pb.f(1, pos) + Pb.f(2, pos) + Pb.f(3, text))
+        return Pb.f(21, Pb.f(1, imeCounter.toLong()) + Pb.f(2, fieldCounter.toLong()) + Pb.f(3, edit))
+    }
+
     private fun sendText() {
         val t = input.text.toString()
         if (t.isEmpty()) return
         if (!ready) { toast("Not connected. Tap Connect."); return }
-        var skipped = 0
-        val seq = ArrayList<Pair<Int, Boolean>>()
-        for (c in t) { val m = keyFor(c); if (m == null) skipped++ else seq.add(m) }
-        net.execute {
-            try {
-                for ((code, shift) in seq) {
-                    if (shift) sendRemote(keyMsg(59, 1))
-                    sendRemote(keyMsg(code, 3))
-                    if (shift) sendRemote(keyMsg(59, 2))
-                    Thread.sleep(25)
-                }
-            } catch (e: Exception) { lost(e) }
-        }
-        log("Typed ${seq.size} characters ($skipped skipped)")
-        if (skipped > 0) toast("$skipped unsupported characters skipped (English letters, digits and common symbols only)")
-        input.setText("")
+        val active = imeActive
+        if (!active) toast("Tap a text box on the TV first (like a search box). Trying anyway.")
+        net.execute { try { sendRemote(imeMsg(t)) } catch (e: Exception) { lost(e) } }
+        log("Sent ${t.length} characters as text (ime=$imeCounter field=$fieldCounter active=$active)")
+        if (active) input.setText("")
     }
 
     // ---------- Finding TVs ----------
@@ -915,7 +936,7 @@ class MainActivity : Activity() {
             textSize = 15f
         }
         val title = TextView(this).apply {
-            text = "Phone Remote  v5.1"
+            text = "Phone Remote  v5.2"
             textSize = 26f
             setTextColor(Color.WHITE)
             setTypeface(typeface, Typeface.BOLD)
